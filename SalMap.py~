@@ -1,0 +1,98 @@
+from PIL import Image
+import itertools
+import numpy as np
+import pyopencl as cl
+import pyopencl.array as cl_array
+from pyopencl.elementwise import ElementwiseKernel
+import math
+ 
+## initialization of GPU context, queue, kernel
+ctx = cl.create_some_context()
+queue = cl.CommandQueue(ctx)
+kernel_args = "int width, int len_min_width, float *image, float *contrast"
+kernel_code = '''
+contrast[i/3] = contrast[i/3] +
+ (!(
+     (i < width) ||
+     (i > len_min_width) || 
+     (i % width == 0) ||
+     ((i+1) % width == 0) ||
+     ((i+2) % width == 0) ||
+     ((i+3) % width == 0) ||
+     ((i-1) % width == 0) ||
+     ((i-2) % width == 0)
+   )
+ )?
+ (
+     pown((image[i] - image[i-width]), 2) +
+     pown((image[i] - image[i-width-3]), 2) +
+     pown((image[i] - image[i-width+3]), 2) +
+     pown((image[i] - image[i-3]), 2) +
+     pown((image[i] - image[i+3]), 2) +
+     pown((image[i] - image[i+width]), 2) +
+     pown((image[i] - image[i+width-3]), 2) +
+     pown((image[i] - image[i+width+3]), 2)
+ ) : 0''' # for each rgb value in image, if not part of a pixel on the image
+          # border, sum the squares of the differences between it and the
+          # corresponding color values of each surrounding pixel, then add
+          # this to the corresponding output pixel's value
+contrast_kernel = ElementwiseKernel(ctx,
+                                    kernel_args,
+                                    kernel_code,
+                                    "contrast")
+ 
+flatten = lambda l: list(itertools.chain(*l))
+ 
+def contrast_map(image):
+     
+    width = image.size[0]
+    height = image.size[1]
+     
+    ## creating numpy arrays
+    image = np.array(flatten(list(image.getdata()))).astype(np.float32) #image array
+    contrast_map = np.zeros((height*width)).astype(np.float32) #blank write array
+     
+    ## send arrays to the gpu:
+    image_gpu = cl_array.to_device(ctx,queue,image) 
+    contrast_map_gpu = cl_array.to_device(ctx,queue,contrast_map) 
+     
+    contrast_kernel(width*3,(image.size - width - 1),image_gpu,contrast_map_gpu) #executing kernel
+    contrast_map = contrast_map_gpu.get().astype(np.float32) #retrieving contrast map from gpu
+    contrast_map = np.nan_to_num(contrast_map) #conversion of NaN values to zero
+     
+    ## normalization:
+    contrast_map += max(contrast_map.min(),0)
+    contrast_map /= contrast_map.max()
+    contrast_map *= 255
+    return contrast_map.astype(np.uint8)
+ 
+def saliency_map(image):
+     
+    width = image.size[0]
+    height = image.size[1]
+     
+    resizes = int(math.floor(math.log(min(width,height),2)) - 3) #calculating necessary number of
+                                                                 #images for gaussian pyramid
+    resized_images = [image.resize((width/factor,height/factor),Image.BICUBIC) 
+                      for factor in [2**x for x in range(resizes)]] #resizing images
+    contrast_resized_images = map(contrast_map, resized_images) #generating contrast maps
+ 
+    ## resizing contrast maps back to original image size:
+    images = list()
+    for i in range(len(contrast_resized_images)):
+        image = Image.new("L",resized_images[i].size)
+        image.putdata(list(contrast_resized_images[i]))
+        images.append(np.array(list(image.resize((width,height)).getdata())))
+ 
+    ## combining images:    
+    result = np.zeros_like(images[0]).astype(np.float32)
+    for image in images:
+        result += image.astype(np.float32)
+         
+    ## normalization:
+    result += max(result.min(),0)
+    result /= result.max()
+    result *= 255
+    output = Image.new("L",(width,height))
+    output.putdata(list(result.astype(np.uint8)))
+    return output
